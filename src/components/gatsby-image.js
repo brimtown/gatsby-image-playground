@@ -1,16 +1,40 @@
 import React from "react"
 import PropTypes from "prop-types"
 
-// Handle legacy names for image queries.
+const logDeprecationNotice = (prop, replacement) => {
+  if (process.env.NODE_ENV === `production`) {
+    return
+  }
+
+  console.log(
+    `
+    The "${prop}" prop is now deprecated and will be removed in the next major version
+    of "gatsby-image".
+    `
+  )
+
+  if (replacement) {
+    console.log(`Please use ${replacement} instead of "${prop}".`)
+  }
+}
+
+// Handle legacy props during their deprecation phase
 const convertProps = props => {
   let convertedProps = { ...props }
-  if (convertedProps.resolutions) {
-    convertedProps.fixed = convertedProps.resolutions
+  const { resolutions, sizes, critical } = convertedProps
+
+  if (resolutions) {
+    convertedProps.fixed = resolutions
     delete convertedProps.resolutions
   }
-  if (convertedProps.sizes) {
-    convertedProps.fluid = convertedProps.sizes
+  if (sizes) {
+    convertedProps.fluid = sizes
     delete convertedProps.sizes
+  }
+
+  if (critical) {
+    logDeprecationNotice(`critical`, `the native "loading" attribute`)
+    convertedProps.loading = `eager`
   }
 
   return convertedProps
@@ -19,14 +43,14 @@ const convertProps = props => {
 // Find the source of an image to use as a key in the image cache.
 // Use `fixed` or `fluid` if specified, or the first image in
 // either `fixedImages` or `fluidImages`
-const getImageSrc = props =>
-  props.fluid
-    ? props.fluid.src
-    : props.fixed
-    ? props.fixed.src
-    : props.fluidImages
-    ? props.fluidImages[0].src
-    : props.fixedImages[0].src
+const getImageSrc = ({ fluid, fixed, fluidImages, fixedImages }) => {
+  const data =
+    fluid ||
+    fixed ||
+    (fluidImages && fluidImages[0]) ||
+    (fixedImages && fixedImages[0])
+  return data.src
+}
 
 // Cache if we've seen an image before so we don't bother with
 // lazy-loading & fading in on subsequent mounts.
@@ -44,6 +68,14 @@ const activateCacheForImage = props => {
   const src = getImageSrc(convertedProps)
   imageCache[src] = true
 }
+
+// Native lazy-loading support: https://addyosmani.com/blog/lazy-loading/
+const hasNativeLazyLoadSupport =
+  typeof HTMLImageElement !== `undefined` &&
+  `loading` in HTMLImageElement.prototype
+
+const isBrowser = typeof window !== `undefined`
+const hasIOSupport = isBrowser && window.IntersectionObserver
 
 let io
 const listeners = new WeakMap()
@@ -92,18 +124,14 @@ function generateImageSources(imageVariants) {
 }
 
 function generateTracedSVGSources(imageVariants) {
-  return imageVariants.map(variant => (
-    <source
-      key={variant.src}
-      media={variant.media}
-      srcSet={variant.tracedSVG}
-    />
+  return imageVariants.map(({ src, media, tracedSVG }) => (
+    <source key={src} media={media} srcSet={tracedSVG} />
   ))
 }
 
 function generateBase64Sources(imageVariants) {
-  return imageVariants.map(variant => (
-    <source key={variant.src} media={variant.media} srcSet={variant.base64} />
+  return imageVariants.map(({ src, media, base64 }) => (
+    <source key={src} media={media} srcSet={base64} />
   ))
 }
 
@@ -117,11 +145,13 @@ function generateNoscriptSource({ srcSet, srcSetWebp, media, sizes }, isWebp) {
 }
 
 function generateNoscriptSources(imageVariants) {
-  return imageVariants.map(
-    variant =>
-      (variant.srcSetWebp ? generateNoscriptSource(variant, true) : ``) +
-      generateNoscriptSource(variant)
-  )
+  return imageVariants
+    .map(
+      variant =>
+        (variant.srcSetWebp ? generateNoscriptSource(variant, true) : ``) +
+        generateNoscriptSource(variant)
+    )
+    .join(``)
 }
 
 const listenToIntersections = (el, cb) => {
@@ -151,25 +181,33 @@ const noscriptImg = props => {
   const crossOrigin = props.crossOrigin
     ? `crossorigin="${props.crossOrigin}" `
     : ``
+  const loading = props.loading ? `loading="${props.loading}" ` : ``
 
-  let initialSources = ``
+  let sources = ``
   if (props.srcSetWebp) {
-    initialSources += generateNoscriptSource(props, true)
+    sources += generateNoscriptSource(props, true)
   }
   if (props.media) {
-    initialSources += generateNoscriptSource(props)
+    sources += generateNoscriptSource(props)
+  }
+  if (props.imageVariants.length > 0) {
+    sources += generateNoscriptSources(props.imageVariants)
   }
 
-  const variantSources =
-    props.imageVariants.length > 0
-      ? generateNoscriptSources(props.imageVariants)
-      : ``
-
-  return `<picture>${initialSources}${variantSources}<img ${width}${height}${sizes}${srcSet}${src}${alt}${title}${crossOrigin}style="position:absolute;top:0;left:0;opacity:1;width:100%;height:100%;object-fit:cover;object-position:center"/></picture>`
+  return `<picture>${sources}<img ${loading}${width}${height}${sizes}${srcSet}${src}${alt}${title}${crossOrigin}style="position:absolute;top:0;left:0;opacity:1;width:100%;height:100%;object-fit:cover;object-position:center"/></picture>`
 }
 
 const Img = React.forwardRef((props, ref) => {
-  const { sizes, srcSet, src, style, onLoad, onError, ...otherProps } = props
+  const {
+    sizes,
+    srcSet,
+    src,
+    style,
+    onLoad,
+    onError,
+    loading,
+    ...otherProps
+  } = props
 
   return (
     <img
@@ -180,6 +218,7 @@ const Img = React.forwardRef((props, ref) => {
       onLoad={onLoad}
       onError={onError}
       ref={ref}
+      loading={loading}
       style={{
         position: `absolute`,
         top: 0,
@@ -204,48 +243,26 @@ class Image extends React.Component {
   constructor(props) {
     super(props)
 
-    // default settings for browser without Intersection Observer available
-    let isVisible = true
-    let imgLoaded = false
-    let imgCached = false
-    let IOSupported = false
-    let fadeIn = props.fadeIn
-
     // If this image has already been loaded before then we can assume it's
     // already in the browser cache so it's cheap to just show directly.
-    const seenBefore = inImageCache(props)
+    this.seenBefore = isBrowser && inImageCache(props)
 
-    // browser with Intersection Observer available
-    if (
-      !seenBefore &&
-      typeof window !== `undefined` &&
-      window.IntersectionObserver
-    ) {
-      isVisible = false
-      IOSupported = true
-    }
+    this.addNoScript = !(props.critical && !props.fadeIn)
+    this.useIOSupport =
+      !hasNativeLazyLoadSupport &&
+      hasIOSupport &&
+      !props.critical &&
+      !this.seenBefore
 
-    // Never render image during SSR
-    if (typeof window === `undefined`) {
-      isVisible = false
-    }
-
-    // Force render for critical images
-    if (props.critical) {
-      isVisible = true
-      IOSupported = false
-    }
-
-    const hasNoScript = !(props.critical && !props.fadeIn)
+    const isVisible =
+      props.critical ||
+      (isBrowser && (hasNativeLazyLoadSupport || !this.useIOSupport))
 
     this.state = {
       isVisible,
-      imgLoaded,
-      imgCached,
-      IOSupported,
-      fadeIn,
-      hasNoScript,
-      seenBefore,
+      imgLoaded: false,
+      imgCached: false,
+      fadeIn: !this.seenBefore && props.fadeIn,
     }
 
     this.imageRef = React.createRef()
@@ -271,8 +288,9 @@ class Image extends React.Component {
     }
   }
 
+  // Specific to IntersectionObserver based lazy-load support
   handleRef(ref) {
-    if (this.state.IOSupported && ref) {
+    if (this.useIOSupport && ref) {
       this.cleanUpListeners = listenToIntersections(ref, () => {
         const imageInCache = inImageCache(this.props)
         if (
@@ -289,6 +307,8 @@ class Image extends React.Component {
         this.setState({ isVisible: true }, () =>
           this.setState({
             imgLoaded: imageInCache,
+            // `currentSrc` should be a string, but can be `undefined` in IE,
+            // !! operator validates the value is not undefined/null/""
             imgCached: !!this.imageRef.current.currentSrc,
           })
         )
@@ -300,9 +320,6 @@ class Image extends React.Component {
     activateCacheForImage(this.props)
 
     this.setState({ imgLoaded: true })
-    if (this.state.seenBefore) {
-      this.setState({ fadeIn: false })
-    }
 
     if (this.props.onLoad) {
       this.props.onLoad()
@@ -326,9 +343,10 @@ class Image extends React.Component {
       durationFadeIn,
       Tag,
       itemProp,
+      loading,
     } = convertProps(this.props)
 
-    const shouldReveal = this.state.imgLoaded || this.state.fadeIn === false
+    const shouldReveal = this.state.fadeIn === false || this.state.imgLoaded
     const shouldFadeIn = this.state.fadeIn === true && !this.state.imgCached
 
     const imageStyle = {
@@ -359,7 +377,7 @@ class Image extends React.Component {
     }
 
     if (fluid || fluidImages) {
-      // First image data is supplied to `image`, if an array the rest will go to `variants`
+      // Image variants support. First element to `image`, remaining to `imageVariants`
       const [image, ...imageVariants] = fluidImages ? fluidImages : [fluid]
 
       return (
@@ -445,15 +463,22 @@ class Image extends React.Component {
                 onLoad={this.handleImageLoaded}
                 onError={this.props.onError}
                 itemProp={itemProp}
+                loading={loading}
               />
             </picture>
           )}
 
           {/* Show the original image during server-side rendering if JavaScript is disabled */}
-          {this.state.hasNoScript && (
+          {this.addNoScript && (
             <noscript
               dangerouslySetInnerHTML={{
-                __html: noscriptImg({ alt, title, ...image, imageVariants }),
+                __html: noscriptImg({
+                  alt,
+                  title,
+                  loading,
+                  ...image,
+                  imageVariants,
+                }),
               }}
             />
           )}
@@ -462,6 +487,7 @@ class Image extends React.Component {
     }
 
     if (fixed || fixedImages) {
+      // Image variants support. First element to `image`, remaining to `imageVariants`
       const [image, ...imageVariants] = fixedImages ? fixedImages : [fixed]
       const divStyle = {
         position: `relative`,
@@ -547,17 +573,19 @@ class Image extends React.Component {
                 onLoad={this.handleImageLoaded}
                 onError={this.props.onError}
                 itemProp={itemProp}
+                loading={loading}
               />
             </picture>
           )}
 
           {/* Show the original image during server-side rendering if JavaScript is disabled */}
-          {this.state.hasNoScript && (
+          {this.addNoScript && (
             <noscript
               dangerouslySetInnerHTML={{
                 __html: noscriptImg({
                   alt,
                   title,
+                  loading,
                   ...image,
                   imageVariants,
                 }),
@@ -573,11 +601,13 @@ class Image extends React.Component {
 }
 
 Image.defaultProps = {
-  critical: false,
   fadeIn: true,
   durationFadeIn: 500,
   alt: ``,
   Tag: `div`,
+  // We set it to `lazy` by default because it's best to default to a performant
+  // setting and let the user "opt out" to `eager`
+  loading: `lazy`,
 }
 
 const fixedObject = PropTypes.shape({
@@ -628,6 +658,7 @@ Image.propTypes = {
   onStartLoad: PropTypes.func,
   Tag: PropTypes.string,
   itemProp: PropTypes.string,
+  loading: PropTypes.oneOf([`auto`, `lazy`, `eager`]),
 }
 
 export default Image
